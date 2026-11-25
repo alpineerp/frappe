@@ -358,19 +358,12 @@ class EmailAccount(Document):
 	def there_must_be_only_one_default(self):
 		"""If current Email Account is default, un-default all other accounts."""
 		for field in ("default_incoming", "default_outgoing"):
-			if not self.get(field):
-				continue
-
-			for email_account in frappe.get_all("Email Account", filters={field: 1}):
-				if email_account.name == self.name:
-					continue
-
-				email_account = frappe.get_doc("Email Account", email_account.name)
-				email_account.set(field, 0)
-				email_account.save()
+			if self.get(field):
+				frappe.db.set_value("Email Account", {field: 1, "name": ("!=", self.name)}, field, 0)
 
 	@frappe.whitelist()
 	def get_domain_values(self, domain: str):
+		frappe.has_permission("Email Domain", "read", domain, throw=True)
 		return frappe.db.get_value("Email Domain", domain, EMAIL_DOMAIN_FIELDS, as_dict=True)
 
 	def get_incoming_server(self, in_receive=False, email_sync_rule="UNSEEN"):
@@ -704,7 +697,7 @@ class EmailAccount(Document):
 				# then do not send notifications for the same email.
 				if communication and mail.flags.is_new_communication:
 					# notify all participants of this thread
-					if self.enable_auto_reply:
+					if self.enable_auto_reply and not mail.is_auto_submitted():
 						self.send_auto_reply(communication, mail)
 
 					communication.send_email(is_inbound_mail_communcation=True)
@@ -837,8 +830,9 @@ class EmailAccount(Document):
 				or frappe.get_template("templates/emails/auto_reply.html").render(communication.as_dict()),
 				reference_doctype=communication.reference_doctype,
 				reference_name=communication.reference_name,
-				in_reply_to=email.mail.get("Message-Id"),  # send back the Message-Id as In-Reply-To
+				in_reply_to=communication.name,
 				unsubscribe_message=unsubscribe_message,
+				auto_submitted="auto-replied",
 			)
 
 	def get_unreplied_notification_emails(self):
@@ -952,7 +946,7 @@ def notify_unreplied():
 		email_account = frappe.get_doc("Email Account", email_account.name)
 
 		if email_account.use_imap:
-			append_to = [folder.get("append_to") for folder in email_account.imap_folder]
+			append_to = [folder.append_to for folder in email_account.imap_folder if folder.append_to]
 		else:
 			append_to = email_account.append_to
 

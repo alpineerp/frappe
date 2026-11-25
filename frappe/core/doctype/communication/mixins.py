@@ -216,6 +216,7 @@ class CommunicationEmailMixin:
 				"print_format": print_format,
 				"html": print_html,
 				"print_format_attachment": 1,
+				"print_as_owner": 1,
 				"doctype": self.reference_doctype,
 				"name": self.reference_name,
 				"lang": print_language or frappe.local.lang,
@@ -304,6 +305,9 @@ class CommunicationEmailMixin:
 			is_inbound_mail_communcation=is_inbound_mail_communcation, include_sender=send_me_a_copy
 		)
 		bcc = self.get_mail_bcc_with_displayname(is_inbound_mail_communcation=is_inbound_mail_communcation)
+
+		if is_inbound_mail_communcation:
+			recipients, cc = cc, []
 
 		if not (recipients or cc or bcc):
 			return {}

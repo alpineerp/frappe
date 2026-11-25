@@ -37,6 +37,8 @@ frappe.views.CommunicationComposer = class {
 			size: "large",
 			minimizable: true,
 			keep_open: true,
+			// on a phone a focused To field opens its suggestions and the keyboard over the mail
+			no_focus: frappe.is_mobile(),
 		});
 
 		$(this.dialog.$wrapper.find(".form-section").get(0)).addClass("to_section");
@@ -1093,6 +1095,10 @@ frappe.views.CommunicationComposer = class {
 		$more.remove();
 	}
 
+	is_own_email(sender) {
+		return [cstr(sender), frappe.session.user_email].includes(this.last_email.sender);
+	}
+
 	setup_recipients_if_reply() {
 		if (!this.is_a_reply || !this.last_email) return;
 		let sender = this.dialog.get_value("sender");
@@ -1103,7 +1109,7 @@ frappe.views.CommunicationComposer = class {
 			bcc: this.dialog.fields_dict.bcc,
 		};
 		// If same user replies to their own email, set recipients to last email recipients
-		if (this.last_email.sender == sender) {
+		if (this.is_own_email(sender)) {
 			fields.recipients.set_value(this.as_recipient_list(this.last_email.recipients));
 			if (this.reply_all) {
 				fields.cc.set_value(this.as_recipient_list(this.last_email.cc));
@@ -1136,7 +1142,7 @@ frappe.views.CommunicationComposer = class {
 		if (!this.forward && !this.recipients && this.last_email) {
 			this.recipients = this.last_email.sender;
 			// If same user replies to their own email, set recipients to last email recipients
-			if (this.last_email.sender == this.sender) {
+			if (this.is_own_email(this.sender)) {
 				this.recipients = this.last_email.recipients;
 			}
 

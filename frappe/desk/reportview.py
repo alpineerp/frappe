@@ -160,6 +160,10 @@ def validate_fields(data):
 		if not fieldname:
 			raise_invalid_field(fieldname)
 
+		if fieldname.rsplit(".", 1)[-1].strip("`") == "_comments":
+			data.fields.remove(field)
+			continue
+
 		if is_standard(fieldname):
 			continue
 
@@ -400,7 +404,7 @@ def save_report(name: str | int, doctype: str, report_settings: str):
 		if report.report_type != "Report Builder":
 			frappe.throw(_("Only reports of type Report Builder can be edited"))
 
-		if report.owner != frappe.session.user and not report.has_permission("write"):
+		if report.owner != frappe.session.user and not frappe.has_permission("Report", "write", doc=report):
 			frappe.throw(_("Insufficient Permissions for editing Report"), frappe.PermissionError)
 	else:
 		if not frappe.has_permission("Report", "create"):
@@ -440,7 +444,7 @@ def delete_report(name: str | int):
 	if report.report_type != "Report Builder":
 		frappe.throw(_("Only reports of type Report Builder can be deleted"))
 
-	if report.owner != frappe.session.user and not report.has_permission("delete"):
+	if report.owner != frappe.session.user and not frappe.has_permission("Report", "delete", doc=report):
 		frappe.throw(_("Insufficient Permissions for deleting Report"), frappe.PermissionError)
 
 	report.delete(ignore_permissions=True)

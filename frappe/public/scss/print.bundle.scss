@@ -32,6 +32,10 @@ svg[data-barcode-value] {
 			word-break: break-all;
 		}
 	}
+	pre {
+		white-space: pre-wrap;
+		word-break: break-word;
+	}
 }
 
 .action-banner {
@@ -68,6 +72,18 @@ svg[data-barcode-value] {
 	}
 }
 
+.print-grid {
+	tbody tr {
+		height: 30px;
+	}
+	tr.bold td {
+		font-weight: var(--font-weight-bold);
+	}
+}
+
+.print-format.smaller-font {
+	font-size: 4pt;
+}
 // prevent <ol> numbering conflicts
 .ql-editor {
 	counter-reset: none;

@@ -9,9 +9,10 @@ from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import frappe
+from frappe import _
 from frappe.core.doctype.communication.email import make
 from frappe.desk.form.load import get_attachments
-from frappe.email.doctype.email_account.email_account import notify_unreplied
+from frappe.email.doctype.email_account.email_account import EmailAccount, notify_unreplied
 from frappe.email.email_body import get_message_id
 from frappe.email.receive import Email, InboundMail, SentEmailInInboxError
 from frappe.tests import IntegrationTestCase
@@ -346,6 +347,42 @@ class TestEmailAccount(IntegrationTestCase):
 			)
 		)
 
+		(auto_reply,) = self.get_auto_replies(comm)
+		self.assertEqual(auto_reply["Auto-Submitted"], "auto-replied")
+		self.assertEqual(auto_reply["In-Reply-To"], f"<{comm.message_id}>")
+
+	def test_no_auto_reply_to_auto_submitted_mail(self):
+		cleanup("test_sender@example.com")
+
+		messages = {
+			'"INBOX"': {
+				"latest_messages": ["Auto-Submitted: auto-replied\n" + self.get_test_mail("incoming-1.raw")],
+				"seen_status": {2: "UNSEEN"},
+				"uid_list": [2],
+			}
+		}
+
+		email_account = frappe.get_doc("Email Account", "_Test Email Account 1")
+		TestEmailAccount.mocked_email_receive(email_account, messages)
+
+		comm = frappe.get_doc("Communication", {"sender": "test_sender@example.com"})
+		self.assertEqual(self.get_auto_replies(comm), [])
+
+	def get_auto_replies(self, communication):
+		queues = frappe.get_all(
+			"Email Queue",
+			filters={
+				"reference_doctype": communication.reference_doctype,
+				"reference_name": communication.reference_name,
+			},
+			pluck="name",
+		)
+		return [
+			email.message_from_string(queue.message)
+			for queue in (frappe.get_doc("Email Queue", name) for name in queues)
+			if communication.sender in [r.recipient for r in queue.recipients]
+		]
+
 	def test_handle_bad_emails(self):
 		mail_content = self.get_test_mail(fname="incoming-1.raw")
 		message_id = Email(mail_content).mail.get("Message-ID")
@@ -378,6 +415,33 @@ class TestEmailAccount(IntegrationTestCase):
 
 		with self.assertRaises(Exception):
 			email_account.validate()
+
+	def test_moving_the_default_skips_the_old_default_accounts_checks(self):
+		frappe.db.savepoint("move_default")
+		self.addCleanup(frappe.db.rollback, save_point="move_default")
+		frappe.db.set_value("Email Account", "_Test Email Account 1", "default_outgoing", 1)
+		account = frappe.get_doc(
+			{
+				"doctype": "Email Account",
+				"email_account_name": "_Test Move Default",
+				"email_id": "move-default@example.com",
+				"enable_outgoing": 1,
+				"smtp_server": "smtp.example.com",
+			}
+		).insert()
+
+		def validate(doc):
+			if doc.name == "_Test Email Account 1":
+				frappe.throw(_("This mailbox needs reconnecting"))
+
+		with (
+			self.set_user("test@example.com"),
+			patch.object(EmailAccount, "validate", autospec=True, side_effect=validate),
+		):
+			account.default_outgoing = 1
+			account.save()
+
+		self.assertEqual(frappe.db.get_value("Email Account", "_Test Email Account 1", "default_outgoing"), 0)
 
 	def test_validation_surfaces_imap_auth_error(self):
 		# auth failure on save must raise, not swallow and leak a NONAUTH LIST error
@@ -593,6 +657,27 @@ class TestInboundMail(IntegrationTestCase):
 		d = {**defaults, **kwargs}
 		return self.new_doc("ToDo", **d)
 
+	def test_is_auto_submitted(self):
+		email_account = frappe.get_doc("Email Account", "_Test Email Account 1")
+		mail_content = self.get_test_mail(fname="incoming-1.raw")
+		cases = {
+			"": False,
+			"Auto-Submitted: no\n": False,
+			"Auto-Submitted: auto-replied\n": True,
+			"Auto-Submitted: Auto-Generated\n": True,
+			"X-Autoreply: yes\n": True,
+			"X-Autorespond: yes\n": True,
+			"Precedence: bulk\n": True,
+			"Precedence: junk\n": True,
+			"Precedence: list\n": False,
+			"Precedence: first-class\n": False,
+		}
+		for header, expected in cases.items():
+			with self.subTest(header=header):
+				self.assertEqual(
+					InboundMail(header + mail_content, email_account).is_auto_submitted(), expected
+				)
+
 	def test_self_sent_mail(self):
 		"""Check that we raise SentEmailInInboxError if the inbound mail is self sent mail."""
 		mail_content = self.get_test_mail(fname="incoming-self-sent.raw")
@@ -698,7 +783,7 @@ class TestInboundMail(IntegrationTestCase):
 
 	def test_reference_document_by_record_name_in_subject(self):
 		# Create email queue record
-		todo = self.new_todo()
+		todo = self.new_todo(sender="test_sender@example.com")
 
 		mail_content = self.get_test_mail(fname="incoming-subject-placeholder.raw").replace(
 			"{{ subject }}", f"RE: (#{todo.name})"

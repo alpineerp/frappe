@@ -258,7 +258,17 @@ def run_doc_method(method: str, document: dict[str, Any] | str, kwargs=None):
 	if kwargs is None:
 		kwargs = {}
 
-	doc = frappe.get_doc(document, check_permission=PERMISSION_MAP[frappe.request.method])
+	doc = frappe.get_doc(document)
+	ptype = PERMISSION_MAP[frappe.request.method]
+	# unsaved docs need create, not write; `__islocal` comes from the client, so check the DB too
+	# (a Single always exists, whatever name the client sends)
+	stored = not doc.is_new() or bool(doc.meta.issingle or frappe.db.exists(doc.doctype, doc.name))
+	if ptype == "write" and not stored:
+		ptype = "create"
+	if stored:
+		frappe.has_permission(doc.doctype, ptype, doc.name, throw=True)
+	else:
+		doc.check_permission(ptype)
 	doc._original_modified = doc.modified
 	doc.check_if_latest()
 

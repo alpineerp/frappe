@@ -10,6 +10,8 @@ import shutil
 import zipfile
 from urllib.parse import quote, unquote
 
+import filetype
+
 import frappe
 from frappe import _
 from frappe.database.schema import SPECIAL_CHAR_PATTERN
@@ -20,6 +22,7 @@ from frappe.permissions import SYSTEM_USER_ROLE, get_doctypes_with_read, get_rol
 from frappe.utils import (
 	call_hook_method,
 	cint,
+	cstr,
 	get_files_path,
 	get_hook_method,
 	get_table_name,
@@ -169,6 +172,10 @@ class File(Document):
 		attachment.flags.copy_from_existing_file = True
 		return attachment.insert(ignore_permissions=ignore_permissions)
 
+	def before_validate(self):
+		# here, not in validate(): a File subclass may skip super().validate()
+		self.validate_attachment_change()
+
 	def validate(self):
 		if self.is_folder:
 			if self.file_url:
@@ -194,6 +201,22 @@ class File(Document):
 		self.validate_file_url()
 		self.validate_file_on_disk()
 		self.file_size = frappe.form_dict.file_size or self.file_size
+
+	def validate_attachment_change(self):
+		"""Apply the stored row's permission and protection before its document or content changes."""
+		doc_before_save = self.get_doc_before_save()
+		if not doc_before_save or self.flags.ignore_permissions or frappe.flags.in_install:
+			return
+
+		is_moved = any(
+			cstr(self.get(fieldname)) != cstr(doc_before_save.get(fieldname))
+			for fieldname in ("attached_to_doctype", "attached_to_name")
+		)
+		if is_moved:
+			doc_before_save.check_permission("write")
+
+		if is_moved or self.has_value_changed("file_url"):
+			doc_before_save.validate_protected_file()
 
 	def validate_attachment_references(self):
 		if not self.attached_to_doctype:
@@ -646,6 +669,13 @@ class File(Document):
 			ref_doc = frappe.get_doc(self.attached_to_doctype, self.attached_to_name)
 		except DoesNotExistError:
 			return
+		except ImportError:
+			if (
+				frappe.db.exists("DocType", self.attached_to_doctype)
+				and frappe.get_meta(self.attached_to_doctype).protect_attached_files
+			):
+				raise
+			return
 
 		if ref_doc.docstatus == 0:
 			# If the document is not submitted yet, users can correct wrong attachments
@@ -659,7 +689,7 @@ class File(Document):
 			return
 
 		frappe.throw(
-			msg=_("This file is attached to a protected document and cannot be deleted."),
+			msg=_("This file is attached to a protected document and cannot be changed or deleted."),
 			title=_("Protected File"),
 		)
 
@@ -682,7 +712,7 @@ class File(Document):
 
 	def unzip(self) -> list["File"]:
 		"""Unzip current file and replace it by its children"""
-		from frappe.core.api.file import get_max_extract_size
+		from frappe.core.api.file import get_max_extract_members, get_max_extract_size
 
 		if not self.file_url.endswith(".zip"):
 			frappe.throw(_("{0} is not a zip file").format(self.file_name))
@@ -702,6 +732,13 @@ class File(Document):
 				if not (file.is_dir() or file.filename.startswith("__MACOSX/"))
 				and not os.path.basename(file.filename).startswith(".")
 			]
+
+			if len(members) > get_max_extract_members():
+				frappe.throw(
+					_("Zip file contains more than the maximum allowed {0} files").format(
+						get_max_extract_members()
+					)
+				)
 
 			# Reject on declared (central directory) sizes before reading any member,
 			# so a small, highly compressible archive can't force large reads/writes.
@@ -773,7 +810,9 @@ class File(Document):
 			encodings = FILE_ENCODING_OPTIONS
 		with open(file_path, mode="rb") as f:
 			self._content = f.read()
-			if not self._content.startswith(OLE_FILE_SIGNATURE):
+			# Only decode if not a binary file
+			kind = filetype.guess(self._content)
+			if not kind and not self._content.startswith(OLE_FILE_SIGNATURE):
 				# looping will not result in slowdown, as the content is usually utf-8 or utf-8-sig
 				# encoded so the first iteration will be enough most of the time
 				for encoding in encodings:
@@ -881,7 +920,7 @@ class File(Document):
 		self.content_hash = get_content_hash(self._content)
 
 		# check if a file exists with the same content hash and is also in the same folder (public or private)
-		if not ignore_existing_file_check:
+		if not ignore_existing_file_check and not overwrite:
 			duplicate_file = frappe.get_value(
 				"File",
 				{"content_hash": self.content_hash, "is_private": self.is_private},
@@ -907,6 +946,7 @@ class File(Document):
 				and not frappe.db.exists("File", {"file_url": self.file_url, "name": ("!=", self.name)})
 			)
 			if not in_place:
+				self.flags.pop("original_content", None)
 				self.file_name = generate_file_name(
 					name=self.file_name,
 					suffix=self.content_hash[-6:],
@@ -1004,6 +1044,7 @@ class File(Document):
 
 	@frappe.whitelist()
 	def optimize_file(self):
+		frappe.has_permission(self.doctype, "write", self.name, throw=True)
 		if self.is_folder:
 			raise TypeError("Folders cannot be optimized")
 
@@ -1046,17 +1087,22 @@ class File(Document):
 
 	@staticmethod
 	def zip_files(files):
+		requested, added = set(), set()
 		zip_file = io.BytesIO()
 		zf = zipfile.ZipFile(zip_file, "w", zipfile.ZIP_DEFLATED)
 		for _file in files:
 			if isinstance(_file, str):
+				if _file in requested:
+					continue
+				requested.add(_file)
 				_file = frappe.get_doc("File", _file)
 			if not isinstance(_file, File):
 				continue
-			if _file.is_folder:
+			if _file.is_folder or _file.name in added:
 				continue
 			if not has_permission(_file, "read"):
 				continue
+			added.add(_file.name)
 			zf.writestr(_file.file_name, _file.get_content())
 		zf.close()
 		return zip_file.getvalue()

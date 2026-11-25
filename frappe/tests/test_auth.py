@@ -2,6 +2,7 @@
 # License: MIT. See LICENSE
 import datetime
 import time
+from unittest.mock import patch
 
 import requests
 from werkzeug.test import EnvironBuilder
@@ -11,11 +12,11 @@ import frappe
 from frappe.auth import CookieManager, LoginAttemptTracker, validate_auth
 from frappe.core.doctype.user.user import generate_keys
 from frappe.frappeclient import AuthError, FrappeClient
-from frappe.sessions import Session, get_expired_sessions, get_expiry_in_seconds
+from frappe.sessions import Session, get_expired_sessions, get_expiry_in_seconds, hash_sid
 from frappe.tests import IntegrationTestCase, UnitTestCase
 from frappe.tests.test_api import FrappeAPITestCase
 from frappe.utils import get_datetime, get_site_url, now
-from frappe.utils.data import add_to_date
+from frappe.utils.data import add_to_date, sha256_hash
 from frappe.www.login import _generate_temporary_login_link
 
 
@@ -194,6 +195,55 @@ class TestAuth(IntegrationTestCase):
 		self.assertNotEqual(frappe.local.response.get("message"), "Password Reset")
 		self.assertNotIn("redirect_to", frappe.local.response)
 
+	def test_login_lands_on_default_app(self):
+		from frappe.auth import LoginManager
+		from frappe.hooks import app_home
+		from frappe.utils import set_request
+
+		def home_page_after_login():
+			frappe.cache.hdel("home_page", self.test_user_email)
+			set_request(method="POST", path="/api/method/login")
+			frappe.form_dict.usr = self.test_user_email
+			frappe.form_dict.pwd = self.test_user_password
+			frappe.local.response = frappe._dict()
+			frappe.local.request_ip = "127.0.0.68"
+			frappe.local.cookie_manager = CookieManager()
+			frappe.local.login_manager = LoginManager()
+			return frappe.local.response.home_page
+
+		self.addCleanup(frappe.form_dict.clear)
+		self.addCleanup(self.set_system_settings, "default_app", "")
+		for doctype, field in (("Website Settings", "home_page"), ("Portal Settings", "default_portal_home")):
+			self.addCleanup(
+				frappe.db.set_single_value, doctype, field, frappe.db.get_single_value(doctype, field)
+			)
+		self.addCleanup(frappe.db.set_value, "Role", "System Manager", "home_page", None)
+		self.addCleanup(frappe.db.set_value, "User", self.test_user_email, "default_workspace", None)
+
+		# only frappe is installed in CI, and the apps screen leaves it out
+		with patch("frappe.apps.get_apps", return_value=[{"name": "test_app", "route": "/desk/test-app"}]):
+			self.assertEqual(home_page_after_login(), "desk")
+
+			self.set_system_settings("default_app", "frappe")
+			self.assertEqual(home_page_after_login(), app_home)
+
+			frappe.db.set_single_value("Website Settings", "home_page", "about")
+			self.assertEqual(home_page_after_login(), app_home)
+
+			frappe.db.set_single_value("Portal Settings", "default_portal_home", "/contact")
+			self.assertEqual(home_page_after_login(), app_home)
+
+			frappe.db.set_value("User", self.test_user_email, "default_workspace", "Users")
+			self.assertEqual(home_page_after_login(), "/desk/users")
+
+			frappe.db.set_value("User", self.test_user_email, "default_workspace", None)
+			frappe.db.set_single_value("Portal Settings", "default_portal_home", None)
+			with self.patch_hooks({"role_home_page": {"System Manager": ["orders"]}}):
+				self.assertEqual(home_page_after_login(), "orders")
+
+			frappe.db.set_value("Role", "System Manager", "home_page", "todo")
+			self.assertEqual(home_page_after_login(), "todo")
+
 	def test_login_with_email_link(self):
 		user = self.test_user_email
 
@@ -340,6 +390,19 @@ class TestIPRestrictionForAPIAuth(IntegrationTestCase):
 		validate_auth()
 		self.assertEqual(frappe.session.user, self.user_email)
 
+	def test_auth_hook_user_without_user_record(self):
+		frappe.local.request = Request(EnvironBuilder().get_environ())
+		frappe.local.request_ip = "10.0.0.1"
+		frappe.set_user("Guest")
+
+		with patch(
+			"frappe.auth.validate_auth_via_hooks",
+			side_effect=lambda: frappe.set_user("no-such-user@example.com"),
+		):
+			validate_auth()
+
+		self.assertEqual(frappe.session.user, "no-such-user@example.com")
+
 
 class TestLoginAttemptTracker(IntegrationTestCase):
 	def test_account_lock(self):
@@ -380,6 +443,60 @@ class TestLoginAttemptTracker(IntegrationTestCase):
 		self.assertTrue(tracker.is_user_allowed())
 
 
+class TestSessionIdHashing(FrappeAPITestCase):
+	"""Sessions are stored under the sha256 of the sid, never the sid itself.
+
+	The raw sid lives only in the client's cookie, so a dump of `tabSessions` or of the
+	session cache yields nothing that can be replayed as a session.
+	"""
+
+	def sessions_row(self, stored_sid):
+		return frappe.db.sql("select user from tabSessions where sid=%s", stored_sid)
+
+	def test_raw_sid_is_never_stored(self):
+		sid = self.sid
+		self.assertFalse(self.sessions_row(sid), "raw sid must not appear in tabSessions")
+		self.assertFalse(frappe.cache.hget("session", sid), "raw sid must not key the session cache")
+
+	def test_session_is_stored_under_its_hash(self):
+		sid = self.sid
+		row = self.sessions_row(hash_sid(sid))
+		self.assertTrue(row, "session must be stored under the hash of the sid")
+		self.assertEqual(row[0][0], "Administrator")
+		self.assertTrue(frappe.cache.hget("session", hash_sid(sid)))
+
+	def test_cached_payload_does_not_carry_the_sid(self):
+		sid = self.sid
+		payload = frappe.cache.hget("session", hash_sid(sid))
+		self.assertNotIn("sid", payload, "the cached session must not carry the raw sid")
+
+	def request_with_cookie(self, sid):
+		"""Put a request carrying `sid` on this thread, restored when the test ends."""
+		from frappe.utils import set_request
+
+		original_request = getattr(frappe.local, "request", None)
+		if original_request is not None:
+			self.addCleanup(setattr, frappe.local, "request", original_request)
+		else:
+			self.addCleanup(delattr, frappe.local, "request")
+
+		set_request(path="/")
+		frappe.local.request.cookies = {"sid": sid}
+
+	def test_raw_cookie_resumes_the_session(self):
+		self.request_with_cookie(self.sid)
+		self.assertEqual(Session(user=None, resume=True).user, "Administrator")
+
+	def test_sid_hash_follows_sid(self):
+		self.request_with_cookie(self.sid)
+		session = Session(user=None, resume=True)
+		session.sid = "a" * 32
+		self.assertEqual(session.sid_hash, sha256_hash("a" * 32))
+
+	def test_guest_sid_is_not_hashed(self):
+		self.assertEqual(hash_sid("Guest"), "Guest")
+
+
 class TestSessionExpiry(FrappeAPITestCase):
 	def test_session_expires(self):
 		sid = self.sid  # triggers login for test case login
@@ -400,7 +517,8 @@ class TestSessionExpiry(FrappeAPITestCase):
 		# 1% higher should immediately expire
 		time_of_expiry = add_to_date(session_created, seconds=expiry_in * 1.01, as_string=True)
 		with self.freeze_time(time_of_expiry):
-			self.assertIn(sid, get_expired_sessions())
+			# sessions are stored under the hash of the sid, not the raw cookie value
+			self.assertIn(hash_sid(sid), get_expired_sessions())
 			self.assertFalse(s.get_session_data_from_db())
 
 	def test_expired_session_answers_401_without_leaking_method(self):

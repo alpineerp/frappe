@@ -211,6 +211,7 @@ body {
 {%- if repeat_frame %}
 .print-repeating-frame {
 	width: 100%;
+	table-layout: fixed;
 	border-collapse: collapse;
 }
 .print-repeating-frame > thead {
@@ -292,6 +293,11 @@ body::before {
 .print-format-doc .field.left-right .value,
 .print-format-doc .field.field-inline .value {
 	color: {{ print_format.value_color }};
+}
+.print-format-doc .field .value a,
+.print-format-doc .field .value pre,
+.print-format-doc .field .value code {
+	color: inherit;
 }
 {%- endif %}
 

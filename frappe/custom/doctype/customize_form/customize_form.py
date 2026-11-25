@@ -52,6 +52,7 @@ class CustomizeForm(Document):
 		doc_type: DF.Link | None
 		editable_grid: DF.Check
 		email_append_to: DF.Check
+		enable_upload_first_workflow: DF.Check
 		fields: DF.Table[CustomizeFormField]
 		force_re_route_to_default_view: DF.Check
 		grid_page_length: DF.Int
@@ -59,6 +60,7 @@ class CustomizeForm(Document):
 		is_calendar_and_gantt: DF.Check
 		istable: DF.Check
 		label: DF.Data | None
+		link_display_mode: DF.Literal["Search", "Select"]
 		link_filters: DF.JSON | None
 		links: DF.Table[DocTypeLink]
 		make_attachments_public: DF.Check
@@ -81,6 +83,7 @@ class CustomizeForm(Document):
 		search_fields: DF.Data | None
 		sender_field: DF.Data | None
 		sender_name_field: DF.Data | None
+		show_image_in_link: DF.Check
 		show_name_in_global_search: DF.Check
 		show_preview_popup: DF.Check
 		show_title_field_in_link: DF.Check
@@ -232,6 +235,11 @@ class CustomizeForm(Document):
 
 		validate_series(self, self.autoname, self.doc_type)
 		validate_autoincrement_autoname(self)
+		fieldnames = [df.fieldname for df in self.fields]
+		meta_fieldnames = [df.fieldname for df in frappe.get_meta(self.doc_type).fields]
+		self.flags.field_order_unchanged = [f for f in fieldnames if f in meta_fieldnames] == [
+			f for f in meta_fieldnames if f in fieldnames
+		]
 		self.flags.update_db = False
 		self.flags.rebuild_doctype_for_global_search = False
 		self.update_custom_fields()
@@ -283,6 +291,9 @@ class CustomizeForm(Document):
 		# action and links
 		self.set_property_setters_for_actions_and_links(meta)
 
+		# field order last, with fresh meta, as the changes above can change the default order
+		self.set_property_setter_for_field_order(frappe.get_meta(self.doc_type, cached=False))
+
 	def set_property_setter_for_field_order(self, meta):
 		new_order = [df.fieldname for df in self.fields]
 		existing_order = getattr(meta, "field_order", None)
@@ -297,6 +308,13 @@ class CustomizeForm(Document):
 			return
 
 		if existing_order and new_order == json.loads(existing_order):
+			return
+
+		if (
+			not existing_order
+			and self.flags.field_order_unchanged
+			and new_order == [df.fieldname for df in meta.fields]
+		):
 			return
 
 		frappe.make_property_setter(
@@ -315,8 +333,6 @@ class CustomizeForm(Document):
 		for prop, prop_type in doctype_properties.items():
 			if self.get(prop) != meta.get(prop):
 				self.make_property_setter(prop, self.get(prop), prop_type)
-
-		self.set_property_setter_for_field_order(meta)
 
 	def set_property_setters_for_docfield(self, meta, df, meta_df):
 		for prop, prop_type in docfield_properties.items():
@@ -741,6 +757,7 @@ doctype_properties = {
 	"max_attachments": "Int",
 	"make_attachments_public": "Check",
 	"protect_attached_files": "Check",
+	"enable_upload_first_workflow": "Check",
 	"track_changes": "Check",
 	"track_views": "Check",
 	"allow_auto_repeat": "Check",
@@ -759,6 +776,8 @@ doctype_properties = {
 	"default_view": "Select",
 	"force_re_route_to_default_view": "Check",
 	"translated_doctype": "Check",
+	"link_display_mode": "Select",
+	"show_image_in_link": "Check",
 	"grid_page_length": "Int",
 	"rows_threshold_for_grid_search": "Int",
 }

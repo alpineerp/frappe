@@ -80,6 +80,14 @@ class TestInitiateMailboxConnect(IntegrationTestCase):
 		challenge = base64.urlsafe_b64encode(hashlib.sha256(note["verifier"].encode()).digest()).rstrip(b"=")
 		self.assertEqual(data["code_challenge"], challenge.decode())
 
+	def test_new_mailbox_signs_in_with_the_address_entered(self) -> None:
+		email_oauth.initiate_mailbox_connect("GMail", "/helpdesk", email="one@email-oauth.example.com")
+
+		data = self.pilot.call_args.args[1]
+		self.assertEqual(data["login_hint"], "one@email-oauth.example.com")
+		note = frappe.cache.get_value(f"pkce_verifier:{data['state']}")
+		self.assertEqual(note["email"], "one@email-oauth.example.com")
+
 	def test_user_without_email_account_permission_is_refused(self) -> None:
 		user = frappe.get_doc(
 			{
@@ -211,24 +219,35 @@ class TestOneClickServices(IntegrationTestCase):
 		self.enterContext(self.set_user(create_user(USER).name))
 		self.enterContext(patch.dict(frappe.conf, V2))
 		self.pilot: MagicMock = self.enterContext(
-			patch.object(email_oauth.PilotClient, "post", return_value=["microsoft", "zoho"])
+			patch.object(email_oauth.PilotClient, "post", return_value={"microsoft": None, "zoho": None})
 		)
 		email_oauth.get_active_providers.clear_cache()
 		self.addCleanup(email_oauth.get_active_providers.clear_cache)
 
 	def test_lists_the_services_frappe_cloud_has_turned_on_and_this_site_knows(self) -> None:
-		self.assertEqual(email_oauth.get_one_click_services(), {"Outlook.com": "Outlook"})
+		self.assertEqual(
+			email_oauth.get_one_click_services(),
+			{"Outlook.com": {"label": "Outlook", "client_id": None}},
+		)
 		self.assertEqual(self.pilot.call_args.args[0], pilot_path("get_active_providers"))
 
 	def test_lists_every_provider_this_site_knows(self) -> None:
-		self.pilot.return_value = ["google", "microsoft", "yahoo", "yandex"]
+		self.pilot.return_value = {"google": "gid", "microsoft": None, "yahoo": None, "yandex": None}
+		self.assertEqual(
+			{s: v["label"] for s, v in email_oauth.get_one_click_services().items()},
+			{"Outlook.com": "Outlook", "GMail": "Gmail", "Yahoo Mail": "Yahoo", "Yandex.Mail": "Yandex"},
+		)
+		self.assertEqual(email_oauth.get_one_click_services()["GMail"]["client_id"], "gid")
+
+	def test_reads_the_provider_list_an_older_frappe_cloud_sends(self) -> None:
+		self.pilot.return_value = ["microsoft"]
 		self.assertEqual(
 			email_oauth.get_one_click_services(),
-			{"Outlook.com": "Outlook", "GMail": "Gmail", "Yahoo Mail": "Yahoo", "Yandex.Mail": "Yandex"},
+			{"Outlook.com": {"label": "Outlook", "client_id": None}},
 		)
 
 	def test_leaves_out_a_provider_frappe_cloud_has_turned_off(self) -> None:
-		self.pilot.return_value = []
+		self.pilot.return_value = {}
 		self.assertEqual(email_oauth.get_one_click_services(), {})
 
 	def test_asks_frappe_cloud_once_for_ten_minutes(self) -> None:
@@ -241,7 +260,7 @@ class TestOneClickServices(IntegrationTestCase):
 		self.assertEqual(email_oauth.get_one_click_services(), {})
 
 		self.pilot.side_effect = None
-		self.assertEqual(email_oauth.get_one_click_services(), {"Outlook.com": "Outlook"})
+		self.assertIn("Outlook.com", email_oauth.get_one_click_services())
 
 	def test_lists_nothing_off_frappe_cloud_or_without_create_permission(self) -> None:
 		with patch.dict(frappe.conf, {key: None for key in V2}):
@@ -597,6 +616,26 @@ class TestCallback(IntegrationTestCase):
 		)
 		self.assertEqual(frappe.db.count("Connected App"), apps)
 
+	def test_new_mailbox_signed_in_with_another_address_is_not_added(self) -> None:
+		email_oauth.callback(state=self.note(email="One@email-oauth.example.com"), code="c1")
+		self.assertTrue(
+			self.landed().endswith(
+				"?email_oauth=connected&email_oauth_mailbox=One%40email-oauth.example.com&email_oauth_provider=microsoft"
+			)
+		)
+
+		apps = frappe.db.count("Connected App")
+		self.pilot.return_value = token("two@email-oauth.example.com")
+		email_oauth.callback(state=self.note(email="three@email-oauth.example.com"), code="c2")
+
+		self.assertTrue(
+			self.landed().endswith(
+				"?email_oauth=wrong_mailbox&email_oauth_mailbox=three%40email-oauth.example.com&email_oauth_provider=microsoft"
+			)
+		)
+		self.assertFalse(frappe.db.exists("Email Account", {"email_id": "two@email-oauth.example.com"}))
+		self.assertEqual(frappe.db.count("Connected App"), apps)
+
 	def test_cancelled_reconnect_names_the_mailbox(self) -> None:
 		email_oauth.callback(state=self.note(), code="c1")
 		account = frappe.get_doc("Email Account", {"email_id": "one@email-oauth.example.com"})
@@ -676,7 +715,69 @@ class TestCallback(IntegrationTestCase):
 			"http://hd.localhost:8000/desk?email_oauth=connected&email_oauth_mailbox=one%40email-oauth.example.com&email_oauth_provider=microsoft",
 		)
 
+	def without_default_outgoing(self) -> None:
+		defaults = frappe.get_all("Email Account", {"default_outgoing": 1}, pluck="name")
+		for name in defaults:
+			frappe.db.set_value("Email Account", name, "default_outgoing", 0)
+		frappe.db.commit()  # the callback rolls back a refused save; # nosemgrep
+		self.enterContext(patch.dict(frappe.conf, {"mail_server": None}))
+
+		def restore() -> None:
+			for name in defaults:
+				frappe.db.set_value("Email Account", name, "default_outgoing", 1)
+			frappe.db.commit()  # nosemgrep
+
+		self.addCleanup(restore)
+
+	def test_personal_mailbox_that_cannot_send_is_added_for_receiving_only(self) -> None:
+		self.without_default_outgoing()
+		frappe.get_doc(
+			{
+				"doctype": "Email Account",
+				"name": "out@email-oauth.example.com",
+				"email_account_name": "out@email-oauth.example.com",
+				"email_id": "out@email-oauth.example.com",
+				"enable_outgoing": 1,
+				"default_outgoing": 1,
+			}
+		).db_insert()
+		frappe.db.commit()  # nosemgrep
+
+		def refuse_smtp(account: EmailAccount) -> None:
+			if account.enable_outgoing:
+				raise frappe.ValidationError("5.7.139 SmtpClientAuthentication is disabled for the Mailbox")
+
+		with (
+			patch.object(EmailAccount, "validate", autospec=True, side_effect=refuse_smtp),
+			patch("frappe.log_error") as log,
+		):
+			email_oauth.callback(state=self.note(), code="c")
+
+		log.assert_not_called()  # Microsoft's refusal is handled, so it isn't a failure
+		self.assertTrue(
+			self.landed().endswith(
+				"?email_oauth=connected_receive_only&email_oauth_mailbox=one%40email-oauth.example.com&email_oauth_provider=microsoft"
+			)
+		)
+		account = frappe.get_doc("Email Account", {"email_id": "one@email-oauth.example.com"})
+		self.assertEqual((account.enable_incoming, account.enable_outgoing), (1, 0))
+		self.assertTrue(frappe.db.exists("Connected App", account.connected_app))
+
+	def test_personal_mailbox_is_added_for_receiving_only_beside_a_site_config_sender(self) -> None:
+		self.without_default_outgoing()
+		frappe.conf.mail_server = "smtp.example.com"
+
+		def refuse_smtp(account: EmailAccount) -> None:
+			if account.enable_outgoing:
+				raise frappe.ValidationError("5.7.139 SmtpClientAuthentication is disabled for the Mailbox")
+
+		with patch.object(EmailAccount, "validate", autospec=True, side_effect=refuse_smtp):
+			email_oauth.callback(state=self.note(), code="c")
+
+		self.assertIn("email_oauth=connected_receive_only", self.landed())
+
 	def test_failed_save_leaves_nothing_behind(self) -> None:
+		self.without_default_outgoing()
 		apps = frappe.db.count("Connected App")
 		caches = frappe.db.count("Token Cache")
 		smtp_off = "535 5.7.139 Authentication unsuccessful, SmtpClientAuthentication is disabled"
